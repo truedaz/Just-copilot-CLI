@@ -1,11 +1,39 @@
 import { useState, useEffect, useRef } from 'react';
 import './App.css';
 import SettingsPanel from './SettingsPanel.jsx';
+import VoiceOrb from './components/VoiceOrb.jsx';
+import { useSpeechRecognition } from './hooks/useSpeechRecognition.js';
+import { useSpeechSynthesis } from './hooks/useSpeechSynthesis.js';
+import { useAudioLevel } from './hooks/useAudioLevel.js';
 
 // Detect "remember that X" in user input and extract the fact
 const REMEMBER_RE = /^(?:please\s+)?remember\s+(?:that\s+)?(.+)$/i;
 
+// Strip markdown formatting so TTS reads cleanly
+function stripMarkdown(text) {
+  return text
+    .replace(/```[\s\S]*?```/g, '') // fenced code blocks
+    .replace(/`([^`]+)`/g, '$1')    // inline code
+    .replace(/#{1,6}\s+/g, '')      // headers
+    .replace(/\*\*(.+?)\*\*/g, '$1') // bold
+    .replace(/\*(.+?)\*/g, '$1')     // italic
+    .replace(/~~(.+?)~~/g, '$1')     // strikethrough
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1') // links
+    .replace(/^[-*+]\s+/gm, '')      // unordered bullets
+    .replace(/^\d+\.\s+/gm, '')      // ordered list numbers
+    .replace(/^[-_*]{3,}$/gm, '')    // horizontal rules
+    .replace(/\n{3,}/g, '\n\n')      // excessive blank lines
+    .trim();
+}
+
 const MODE_OPTIONS = ['Agent', 'Ask', 'Plan'];
+const EFFORT_OPTIONS = [
+  { label: 'Auto', value: '' },
+  { label: 'Low', value: 'low' },
+  { label: 'Medium', value: 'medium' },
+  { label: 'High', value: 'high' },
+  { label: 'XHigh', value: 'xhigh' },
+];
 const MODEL_OPTIONS = [
   { label: 'Default (fastest)', value: 'default' },
   { label: 'GPT-4.1 (0x)', value: 'gpt-4.1' },
@@ -29,6 +57,7 @@ function App() {
   const [input, setInput] = useState('');
   const [mode, setMode] = useState(MODE_OPTIONS[0]);
   const [model, setModel] = useState(MODEL_OPTIONS[0].value);
+  const [effort, setEffort] = useState(EFFORT_OPTIONS[0].value);
   const [editingChatId, setEditingChatId] = useState(null);
   const [editName, setEditName] = useState('');
   const [showSettings, setShowSettings] = useState(false);
@@ -42,7 +71,79 @@ function App() {
 
   const bottomRef = useRef(null);
 
-  // Auto-scroll to bottom when messages change
+  // ── Voice mode state ───────────────────────────────────────────────────────
+  const [voiceMode, setVoiceMode] = useState(false);
+  // 'idle' | 'listening' | 'thinking' | 'speaking'
+  const [voiceState, setVoiceState] = useState('idle');
+  const [voiceTranscript, setVoiceTranscript] = useState('');
+  const [voiceSubtitle, setVoiceSubtitle] = useState('');
+
+  // Refs so callbacks in hooks always see current values without stale closures
+  const voiceStateRef = useRef(voiceState);
+  voiceStateRef.current = voiceState;
+  const ttsStartTimeRef = useRef(0);
+
+  const { speak, cancel: cancelSpeech } = useSpeechSynthesis();
+  const { volumeRef, start: startAudio, stop: stopAudio } = useAudioLevel();
+  const abortControllerRef = useRef(null);
+
+  const onVoiceFinalResult = (transcript) => {
+    // Only act when we are listening (not mid-thinking or mid-speaking)
+    if (voiceStateRef.current !== 'listening') return;
+    setVoiceTranscript('');
+    handleVoiceSend(transcript);
+  };
+
+  const onVoiceInterimResult = (interim) => {
+    if (voiceStateRef.current === 'listening') setVoiceTranscript(interim);
+  };
+
+  const onVoiceSpeechStart = () => {
+    // Interrupt TTS only if we are speaking AND enough time has passed
+    // (the 400 ms guard prevents the TTS audio itself from triggering interruption)
+    if (
+      voiceStateRef.current === 'speaking' &&
+      Date.now() - ttsStartTimeRef.current > 400
+    ) {
+      // Abort the in-flight stream so appendSentence stops feeding the queue
+      abortControllerRef.current?.abort();
+      abortControllerRef.current = null;
+      cancelSpeech();
+      // Update ref synchronously so onVoiceFinalResult (which fires next) sees 'listening'
+      voiceStateRef.current = 'listening';
+      setVoiceState('listening');
+      setVoiceSubtitle('');
+    }
+  };
+
+  const { supported: sttSupported, start: startSTT, stop: stopSTT } = useSpeechRecognition({
+    onFinalResult: onVoiceFinalResult,
+    onInterimResult: onVoiceInterimResult,
+    onSpeechStart: onVoiceSpeechStart,
+  });
+
+  const handleVoiceEnter = () => {
+    setVoiceMode(true);
+    setVoiceState('listening');
+    setVoiceTranscript('');
+    setVoiceSubtitle('');
+    startSTT();
+    startAudio(); // start real-time mic level metering
+  };
+
+  const handleVoiceExit = () => {
+    abortControllerRef.current?.abort(); // kill in-flight CLI fetch immediately
+    abortControllerRef.current = null;
+    cancelSpeech();
+    stopSTT();
+    stopAudio(); // stop mic level metering & release mic
+    setVoiceMode(false);
+    setVoiceState('idle');
+    setVoiceTranscript('');
+    setVoiceSubtitle('');
+  };
+
+  // ── Auto-scroll to bottom when messages change
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [chats]);
@@ -71,50 +172,52 @@ function App() {
   };
 
   // Send message
-  const handleSend = async () => {
-    if (!input.trim()) return;
+  // textOverride: if provided, use this text instead of the input state (for voice mode)
+  const handleSend = async (textOverride) => {
+    const text = textOverride !== undefined ? textOverride : input;
+    if (!text.trim()) return;
 
     // Check for "remember that X" pattern
-    const rememberMatch = input.match(REMEMBER_RE);
+    const rememberMatch = text.match(REMEMBER_RE);
     if (rememberMatch) {
       const fact = rememberMatch[1].trim();
       const updated = [...memory, { id: Date.now(), text: fact }];
       saveMemory(updated);
       const ack = { role: 'agent', text: `Got it, I'll remember: "${fact}"` };
-      const userMsg = { role: 'user', text: input };
+      const userMsg = { role: 'user', text };
       const updatedChats = chats.map(c =>
         c.id === currentChatId ? { ...c, messages: [...c.messages, userMsg, ack] } : c
       );
       saveChats(updatedChats);
-      setInput('');
+      if (textOverride === undefined) setInput('');
       return;
     }
 
     // Build context-enriched prompt
-    let enrichedPrompt = input;
+    let enrichedPrompt = text;
     const contextParts = [];
     if (persona) contextParts.push(`[PERSONA/SYSTEM CONTEXT]\n${persona.trim()}\n[END PERSONA]`);
     if (memory.length > 0) {
       contextParts.push(`[USER MEMORY]\n${memory.map(m => `- ${m.text}`).join('\n')}\n[END MEMORY]`);
     }
     if (contextParts.length > 0) {
-      enrichedPrompt = `${contextParts.join('\n\n')}\n\n[USER PROMPT]\n${input}`;
+      enrichedPrompt = `${contextParts.join('\n\n')}\n\n[USER PROMPT]\n${text}`;
     }
 
-    const userMessage = { role: 'user', text: input };
+    const userMessage = { role: 'user', text };
     const updatedWithUser = chats.map(chat =>
       chat.id === currentChatId
         ? { ...chat, messages: [...chat.messages, userMessage] }
         : chat
     );
     saveChats(updatedWithUser);
-    setInput('');
+    if (textOverride === undefined) setInput('');
 
     try {
       const response = await fetch('http://localhost:3001/api/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ prompt: enrichedPrompt, model, mode })
+        body: JSON.stringify({ prompt: enrichedPrompt, model, mode, effort })
       });
       
       const data = await response.json();
@@ -126,11 +229,96 @@ function App() {
             : chat
         );
         saveChats(updatedWithAgent);
+        return data.response; // returned so voice mode can speak it
       } else if (data.error) {
-        alert('Error: ' + data.error);
+        if (textOverride === undefined) alert('Error: ' + data.error);
       }
     } catch (err) {
       console.error('Failed to connect to proxy server:', err);
+    }
+  };
+
+  // Voice-mode send: fetches response then speaks it sentence-by-sentence
+  const handleVoiceSend = async (transcript) => {
+    if (!transcript.trim()) return;
+
+    // Build enriched prompt (same as handleSend, plus short voice note appended)
+    const contextParts = [];
+    if (persona) contextParts.push(`[PERSONA/SYSTEM CONTEXT]\n${persona.trim()}\n[END PERSONA]`);
+    if (memory.length > 0) {
+      contextParts.push(`[USER MEMORY]\n${memory.map(m => `- ${m.text}`).join('\n')}\n[END MEMORY]`);
+    }
+    const voiceNote = 'Reply conversationally in 2-3 plain sentences. No markdown, no lists.';
+    const userPart = contextParts.length > 0
+      ? `${contextParts.join('\n\n')}\n\n[USER PROMPT]\n${transcript}\n\n(${voiceNote})`
+      : `${transcript}\n\n${voiceNote}`;
+    const enrichedPrompt = userPart;
+
+    // Save user message to chat immediately
+    const userMessage = { role: 'user', text: transcript };
+    const updatedWithUser = chats.map(chat =>
+      chat.id === currentChatId
+        ? { ...chat, messages: [...chat.messages, userMessage] }
+        : chat
+    );
+    saveChats(updatedWithUser);
+
+    // Stop STT while thinking/speaking so the bot can't hear its own TTS output
+    stopSTT();
+    setVoiceState('thinking');
+    // Update ref synchronously so interrupt check is accurate
+    voiceStateRef.current = 'thinking';
+
+    const controller = new AbortController();
+    abortControllerRef.current = controller;
+
+    try {
+      const response = await fetch('http://localhost:3001/api/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ prompt: enrichedPrompt, model, mode, effort }),
+        signal: controller.signal,
+      });
+
+      const data = await response.json();
+      if (!data.response) {
+        voiceStateRef.current = 'listening';
+        setVoiceState('listening');
+        return;
+      }
+
+      // Save response to chat history
+      const updatedWithAgent = updatedWithUser.map(chat =>
+        chat.id === currentChatId
+          ? { ...chat, messages: [...chat.messages, { role: 'agent', text: data.response }] }
+          : chat
+      );
+      saveChats(updatedWithAgent);
+
+      // Speak the response — strip markdown so TTS reads cleanly
+      const spokenText = stripMarkdown(data.response);
+      voiceStateRef.current = 'speaking';
+      setVoiceState('speaking');
+      ttsStartTimeRef.current = Date.now();
+      speak(spokenText, {
+        onChunkStart: (chunk) => setVoiceSubtitle(chunk),
+        onDone: () => {
+          voiceStateRef.current = 'listening';
+          setVoiceState('listening');
+          setVoiceSubtitle('');
+          // Delay restart so trailing TTS speaker echo isn't picked up by STT
+          setTimeout(() => startSTT(), 800);
+        },
+      });
+
+    } catch (err) {
+      if (err.name === 'AbortError') return; // user pressed X — already handled
+      console.error('Voice error:', err);
+      voiceStateRef.current = 'listening';
+      setVoiceState('listening');
+      setTimeout(() => startSTT(), 800);
+    } finally {
+      abortControllerRef.current = null;
     }
   };
 
@@ -171,11 +359,37 @@ function App() {
     setCurrentChatId(id);
   };
 
+  const [speakingMsgIndex, setSpeakingMsgIndex] = useState(null);
+
+  const handleSpeakMessage = (text, index) => {
+    // If already speaking this message, stop it
+    if (speakingMsgIndex === index) {
+      cancelSpeech();
+      setSpeakingMsgIndex(null);
+      return;
+    }
+    cancelSpeech();
+    setSpeakingMsgIndex(index);
+    speak(text, {
+      onDone: () => setSpeakingMsgIndex(null),
+    });
+  };
+
   // Get current chat
   const currentChat = chats.find(c => c.id === currentChatId);
 
   return (
     <div className="app-container">
+      {/* Voice mode overlay */}
+      {voiceMode && (
+        <VoiceOrb
+          voiceState={voiceState}
+          transcript={voiceTranscript}
+          subtitle={voiceSubtitle}
+          onExit={handleVoiceExit}
+          volumeRef={volumeRef}
+        />
+      )}
       {/* Sidebar: Chat history */}
       <aside className="sidebar">
         <div className="sidebar-header">
@@ -254,7 +468,26 @@ function App() {
               {currentChat.messages.map((msg, i) => (
                 <div key={i} className={`message-row ${msg.role === 'user' ? 'user' : 'agent'}`}>
                   <div className="message-bubble">
-                    <div className="message-header">{msg.role === 'user' ? 'You' : 'Copilot'}</div>
+                    <div className="message-header">
+                      {msg.role === 'user' ? 'You' : 'Copilot'}
+                      {msg.role === 'agent' && (
+                        <button
+                          className={`speak-msg-btn ${speakingMsgIndex === i ? 'speaking' : ''}`}
+                          title={speakingMsgIndex === i ? 'Stop speaking' : 'Speak response'}
+                          onClick={() => handleSpeakMessage(msg.text, i)}
+                        >
+                          {speakingMsgIndex === i ? (
+                            <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></svg>
+                          ) : (
+                            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                              <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/>
+                              <path d="M19.07 4.93a10 10 0 0 1 0 14.14"/>
+                              <path d="M15.54 8.46a5 5 0 0 1 0 7.07"/>
+                            </svg>
+                          )}
+                        </button>
+                      )}
+                    </div>
                     <div className="message-text">{msg.text}</div>
                   </div>
                 </div>
@@ -283,6 +516,12 @@ function App() {
                 {MODE_OPTIONS.map(opt => <option key={opt} value={opt}>{opt}</option>)}
               </select>
             </div>
+            <div className="control-group">
+              <label>Thinking</label>
+              <select value={effort} onChange={e => setEffort(e.target.value)}>
+                {EFFORT_OPTIONS.map(opt => <option key={opt.value} value={opt.value}>{opt.label}</option>)}
+              </select>
+            </div>
           </div>
           
           <form onSubmit={e => { e.preventDefault(); handleSend(); }} className="input-form">
@@ -296,6 +535,21 @@ function App() {
             <button type="submit" disabled={!input.trim()}>
               <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><line x1="22" y1="2" x2="11" y2="13"></line><polygon points="22 2 15 22 11 13 2 9 22 2"></polygon></svg>
             </button>
+            {sttSupported ? (
+              <button
+                type="button"
+                className="voice-btn"
+                title="Voice mode"
+                onClick={handleVoiceEnter}
+              >
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/>
+                  <path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
+                  <line x1="12" y1="19" x2="12" y2="23"/>
+                  <line x1="8" y1="23" x2="16" y2="23"/>
+                </svg>
+              </button>
+            ) : null}
           </form>
           <div className="input-footer">
             Powered by GitHub Copilot CLI
